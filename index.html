@@ -2035,9 +2035,15 @@ function dateTag() {
   return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,"0")}${String(d.getDate()).padStart(2,"0")}`;
 }
 function exportCurrentTabToExcel() {
-  const t = currentTab();
-  const wb = XLSX.utils.book_new();
-  let filename = `대웅_${dateTag()}.xlsx`;
+  try {
+    const t = currentTab();
+    console.log("[Export] Current tab:", t);
+    if (typeof XLSX === "undefined") {
+      alert("엑셀 라이브러리 로드 실패. 페이지를 새로고침 후 다시 시도하세요.");
+      return;
+    }
+    const wb = XLSX.utils.book_new();
+    let filename = `대웅_${dateTag()}.xlsx`;
 
   if (t === "pipeline" || t === "overview" || t === "mytasks" || t === "alerts" || t === "report") {
     const rows = getFilteredPipelines().map(p => ({
@@ -2092,22 +2098,90 @@ function exportCurrentTabToExcel() {
     XLSX.utils.book_append_sheet(wb, ws, "학회");
     filename = `학회_${dateTag()}.xlsx`;
   } else if (t === "accounts") {
-    const rows = getFilteredRows().map(r => {
+    // Sheet 1: 거래처 마스터 (filtered)
+    const masterRows = getFilteredRows().map(r => {
       const d = decodeRow(r);
       return { "본부": d.hq, "사업부": d.div, "사무소": d.office, "담당자": d.rep, "거래처코드": d.code, "거래처": d.name };
     });
-    const ws = XLSX.utils.json_to_sheet(rows);
-    XLSX.utils.book_append_sheet(wb, ws, "거래처");
-    filename = `거래처_${dateTag()}.xlsx`;
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(masterRows), "거래처 마스터");
+
+    // Sheet 2: 도입 현황 매트릭스 — 거래처별 품목별 단계
+    // Build map: accCode -> { product -> stage }
+    const accProductMap = new Map();
+    State.pipelines.forEach(p => {
+      if (!p.accCode) return;
+      if (!accProductMap.has(p.accCode)) accProductMap.set(p.accCode, { acc: p, products: {} });
+      accProductMap.get(p.accCode).products[p.product] = p.stage;
+    });
+    // Filter to accounts visible under current filters AND that have at least one pipeline
+    const visibleCodes = new Set(getFilteredRows().map(r => r[4])); // r[4] = code
+    const matrixRows = [];
+    accProductMap.forEach((entry, code) => {
+      if (!visibleCodes.has(code)) return;
+      const p = entry.acc;
+      const row = {
+        "거래처코드": p.accCode, "거래처": p.accName,
+        "본부": p.hq, "사업부": p.div, "사무소": p.office, "담당자": p.rep,
+      };
+      PRODUCTS.forEach(pr => { row[pr] = entry.products[pr] || ""; });
+      const stages = Object.values(entry.products);
+      row["진행 품목 수"] = stages.length;
+      row["첫처방 도달 수"] = stages.filter(s => s === TERMINAL_STAGE).length;
+      matrixRows.push(row);
+    });
+    matrixRows.sort((a, b) => (b["진행 품목 수"] || 0) - (a["진행 품목 수"] || 0));
+    if (matrixRows.length) {
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(matrixRows), "도입 현황 매트릭스");
+    }
+
+    // Sheet 3: 상세 내역 — 한 거래처 × 품목 × 단계 = 한 행
+    const detailRows = State.pipelines
+      .filter(p => visibleCodes.has(p.accCode))
+      .sort((a, b) => a.accName.localeCompare(b.accName))
+      .map(p => ({
+        "거래처코드": p.accCode, "거래처": p.accName,
+        "본부": p.hq, "사업부": p.div, "사무소": p.office, "담당자": p.rep,
+        "품목": p.product, "단계": p.stage,
+        "단계 체류일": stageStayDays(p),
+        "상세내용": p.notes || "",
+        "다음활동": p.nextAction || "",
+        "다음활동일": p.nextDate || "",
+        "담당마케터": p.ownerName || p.ownerId,
+        "등록일": p.createdAt ? p.createdAt.slice(0, 10) : "",
+        "마지막업데이트": p.updatedAt ? p.updatedAt.slice(0, 10) : "",
+      }));
+    if (detailRows.length) {
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(detailRows), "상세 내역");
+    }
+
+    filename = `거래처현황_${dateTag()}.xlsx`;
   }
 
-  if (!wb.SheetNames.length) { showToast("내보낼 데이터가 없습니다.", "error"); return; }
-  xlsxSave(wb, filename);
-  showToast("엑셀 저장 완료", "success");
+  // If no sheets were created, add an empty informational sheet so user gets a file
+  if (!wb.SheetNames.length) {
+    const empty = XLSX.utils.aoa_to_sheet([
+      ["내보낼 데이터가 없습니다."],
+      ["현재 탭", t],
+      ["설명", "신규도입처/학회 데이터를 먼저 등록한 뒤 다시 시도하세요."],
+    ]);
+    XLSX.utils.book_append_sheet(wb, empty, "비어있음");
+  }
+
+  console.log("[Export] Sheets:", wb.SheetNames, "filename:", filename);
+  XLSX.writeFile(wb, filename);
+  showToast("엑셀 저장 완료: " + filename, "success");
+  } catch (err) {
+    console.error("[Export] Error:", err);
+    alert("엑셀 다운로드 실패: " + (err.message || err) + "\n\nF12 → Console에서 자세한 에러를 확인하세요.");
+  }
 }
 function exportCurrentTabToPdf() {
-  // Browser print → user chooses "Save as PDF"
-  window.print();
+  // Browser print → user chooses "PDF로 저장" in destination dropdown
+  showToast("인쇄 창에서 '대상 → PDF로 저장' 선택하세요", "success");
+  setTimeout(() => {
+    try { window.print(); }
+    catch (e) { alert("PDF 저장 실패: 브라우저 인쇄 기능이 차단되었을 수 있습니다."); }
+  }, 300);
 }
 
 /* ---------- STALLED ACCOUNTS ---------- */
